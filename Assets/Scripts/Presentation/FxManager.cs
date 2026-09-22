@@ -51,6 +51,8 @@ public class FxManager : MonoBehaviour
         _slide.Emit(3);
     }
 
+    private float _dustW = -1f, _dustH = -1f;
+
     private void LateUpdate()
     {
         if (_dust == null || _cam == null) return;
@@ -60,8 +62,14 @@ public class FxManager : MonoBehaviour
         var t = _dust.transform;
         var cp = _cam.transform.position;
         t.position = new Vector3(cp.x, cp.y, 0f);
-        var sh = _dust.shape;
-        sh.scale = new Vector3(w, h, 1f);
+        // The shape module is a native round-trip per write; the view only changes size during a
+        // punch-zoom, so skip it the other ~99% of frames.
+        if (w != _dustW || h != _dustH)
+        {
+            _dustW = w; _dustH = h;
+            var sh = _dust.shape;
+            sh.scale = new Vector3(w, h, 1f);
+        }
     }
 
     private ParticleSystem CreateDust(Material mat)

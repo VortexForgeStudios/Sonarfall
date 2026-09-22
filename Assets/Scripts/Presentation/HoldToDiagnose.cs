@@ -21,6 +21,13 @@ public class HoldToDiagnose : MonoBehaviour, IPointerDownHandler, IPointerUpHand
     private float _downAt = -1f;
     private bool _fired;
 
+    /// <summary>
+    /// True from the moment the hold fires until the next press begins. uGUI's Button raises
+    /// onClick on the pointer-up that ends the hold as well, so the row's click handler checks this
+    /// and ignores that release — otherwise every diagnostic also toggled the setting it sits on.
+    /// </summary>
+    public bool FiredThisPress => _fired;
+
     public void OnPointerDown(PointerEventData e) { _downAt = Time.unscaledTime; _fired = false; }
     public void OnPointerUp(PointerEventData e) { _downAt = -1f; }
     public void OnPointerExit(PointerEventData e) { _downAt = -1f; }

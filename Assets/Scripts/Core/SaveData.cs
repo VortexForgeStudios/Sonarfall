@@ -15,6 +15,7 @@ public static class SaveData
     private const string KSound      = "em_sound";
     private const string KHaptics    = "em_haptics";
     private const string KNotifs     = "em_notifs";       // local reminders opt-out
+    private const string KNotifAsked = "em_notif_asked";  // the one-time permission prompt has run
     private const string KDailyDone  = "em_daily_done";   // UTC day number of the last daily clear
     private const string KDailyBest  = "em_daily_best";   // best daily score
     private const string KRunFinished= "em_run_finished";  // player has completed one endless run
@@ -124,6 +125,7 @@ public static class SaveData
         PlayerPrefs.SetInt(KTaughtDecoy, 0);
         PlayerPrefs.SetInt(KTaughtExit, 0);
         PlayerPrefs.SetInt(KTaughtGate, 0);
+        PlayerPrefs.SetInt(KNotifAsked, 0);
         PlayerPrefs.SetInt(KCurLevel, 1);
         PlayerPrefs.Save();
     }
@@ -179,6 +181,15 @@ public static class SaveData
         get => PlayerPrefs.GetInt(KNotifs, 1) == 1;
         set { PlayerPrefs.SetInt(KNotifs, value ? 1 : 0); PlayerPrefs.Save(); }
     }
+
+    /// <summary>
+    /// Has the first-PLAY notification prompt already run? Its own flag rather than piggybacking
+    /// on HintSeen or RunFinished: testers who installed before the prompt existed have both of
+    /// those set and would otherwise never be asked at all — which is exactly why "notifications
+    /// don't work" reports came from phones that had simply never granted the permission.
+    /// </summary>
+    public static bool NotifAsked => PlayerPrefs.GetInt(KNotifAsked, 0) == 1;
+    public static void MarkNotifAsked() { PlayerPrefs.SetInt(KNotifAsked, 1); PlayerPrefs.Save(); }
 
     /// <summary>Push saved settings into the systems that consume them.</summary>
     public static void ApplySettings()

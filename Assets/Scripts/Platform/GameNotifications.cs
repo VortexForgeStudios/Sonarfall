@@ -25,6 +25,27 @@ using Unity.Notifications.iOS;
 /// so a notification can never fire at someone who is already playing, and they can never stack up
 /// from repeated sessions.
 ///
+/// HOW THEY REACH A CLOSED APP. On Android each message is an AlarmManager alarm owned by the OS,
+/// not by our process: the app can be swiped out of recents, the phone can be rebooted (the
+/// package's boot receiver re-registers them — "Reschedule on Device Restart" is on in Project
+/// Settings > Mobile Notifications) and the alarm still fires. Two things the app cannot fix and
+/// should not try to:
+///
+///   - The alarms are INEXACT on purpose. Exact alarms need SCHEDULE_EXACT_ALARM, which Android 14
+///     denies by default and Google Play only permits for alarm-clock and calendar apps. Inexact
+///     means "10:00" lands at 10:00 on an awake phone and at the next Doze maintenance window (or
+///     the moment the phone is picked up) on one that sat untouched overnight. For a come-back
+///     reminder that is the right trade.
+///   - Some OEM skins (Xiaomi, Oppo/Realme, Vivo, and Samsung with "Put unused apps to sleep") kill
+///     background alarms for apps they consider idle, or treat a swipe-from-recents as a force
+///     stop. Nothing in code survives a force stop — Android drops every alarm on purpose. The
+///     only remedy is the user excluding the app from battery optimisation.
+///
+/// PERMISSION. Android 13+ needs POST_NOTIFICATIONS granted at runtime. GameManager asks exactly
+/// once, on the first tap of PLAY, and from then on only when the player switches REMINDERS on in
+/// Settings. All three messages are scheduled regardless; the OS simply drops them at fire time if
+/// permission is missing, so nothing else has to know.
+///
 /// Design note on restraint: it would be easy to add "you were 2 tiles away!" and a nudge every
 /// evening. Three well-timed messages that each say something true is the difference between a
 /// reminder and a nuisance, and a player who mutes the app is worth less than one who uninstalls
@@ -34,12 +55,20 @@ public static class GameNotifications
 {
     private const string ChannelId = "sonarfall_default";
 
+    /// <summary>Status-bar glyph, registered in Project Settings > Mobile Notifications > Android.
+    /// Without one Android tints the launcher icon into a white blob.</summary>
+    private const string SmallIconId = "icon_small";
+
     // Local hours-of-day the two daily messages aim for.
     private const int MorningHour = 10;   // "today's maze is live"
     private const int EveningHour = 20;   // "your streak ends tonight" — late enough to be urgent
     private const int WinBackDays = 3;
 
     private static bool _channelReady;
+
+    /// <summary>Set by the REMINDERS long-press so a tester can prove delivery without waiting a day.
+    /// Survives the background reschedule; cleared once it has fired.</summary>
+    private static DateTime _testFireAt = DateTime.MinValue;
 
     /// <summary>Player-facing switch, mirrored in Settings alongside sound and haptics.</summary>
     public static bool Enabled
@@ -54,26 +83,172 @@ public static class GameNotifications
 
     // ---------------------------------------------------------------- permission
 
-    /// <summary>
-    /// Ask for notification permission. Deliberately NOT called at first launch: a permission
-    /// dialog thrown at someone who has not yet played is the most common way to get a permanent
-    /// "deny", and on Android 13+ a denial is sticky. GameManager calls this after the player's
-    /// first level clear, when the app has earned the right to ask.
-    /// </summary>
-    public static void RequestPermission()
+    /// <summary>Where the OS stands on letting this app post. Mirrors the package's enum without
+    /// leaking it into code that compiles on every platform.</summary>
+    public enum Permission
     {
-        if (!Enabled) return;
+        /// <summary>Editor, desktop, or a platform with no gate: treat as allowed.</summary>
+        NotRequired,
+        /// <summary>Never asked yet — the system prompt can still be shown.</summary>
+        NotAsked,
+        Allowed,
+        /// <summary>Denied at the prompt (Android still lets us ask a second time).</summary>
+        Denied,
+        /// <summary>Blocked in system settings, or denied past the point where prompting is possible.
+        /// Only Settings can fix this.</summary>
+        Blocked,
+        /// <summary>A prompt is on screen right now.</summary>
+        Pending,
+    }
+
+    /// <summary>A permission prompt in flight. Poll <see cref="IsDone"/> from a coroutine — the OS
+    /// reports back on its own thread, so nothing here touches Unity objects.</summary>
+    public sealed class Request
+    {
+        internal bool done;
+        internal bool prompted;   // true if a system dialog was actually shown
 #if UNITY_ANDROID && !UNITY_EDITOR
-        // POST_NOTIFICATIONS only exists on API 33+. Below that, notifications are granted at
-        // install and asking would throw.
-        if (GetSdkInt() >= 33 &&
-            !UnityEngine.Android.Permission.HasUserAuthorizedPermission("android.permission.POST_NOTIFICATIONS"))
+        internal PermissionRequest inner;
+#endif
+        public bool IsDone
         {
-            UnityEngine.Android.Permission.RequestUserPermission("android.permission.POST_NOTIFICATIONS");
+            get
+            {
+#if UNITY_ANDROID && !UNITY_EDITOR
+                if (!done && inner != null && inner.Status != PermissionStatus.RequestPending) done = true;
+#endif
+                return done;
+            }
+        }
+
+        /// <summary>Did a dialog appear? False when the answer was already known, so the caller
+        /// can tell "they just said no" from "the OS never asked".</summary>
+        public bool Prompted => prompted;
+    }
+
+    /// <summary>Current standing with the OS. Cheap enough to call from a Settings refresh.</summary>
+    public static Permission Current
+    {
+        get
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            try
+            {
+                switch (AndroidNotificationCenter.UserPermissionToPost)
+                {
+                    case PermissionStatus.Allowed:                    return Permission.Allowed;
+                    case PermissionStatus.NotRequested:               return Permission.NotAsked;
+                    case PermissionStatus.RequestPending:             return Permission.Pending;
+                    case PermissionStatus.NotificationsBlockedForApp: return Permission.Blocked;
+                    default:                                          return Permission.Denied;
+                }
+            }
+            catch { return Permission.NotRequired; }
+#elif UNITY_IOS && !UNITY_EDITOR
+            var s = iOSNotificationCenter.GetNotificationSettings();
+            switch (s.AuthorizationStatus)
+            {
+                case AuthorizationStatus.Authorized:
+                case AuthorizationStatus.Provisional:   return Permission.Allowed;
+                case AuthorizationStatus.NotDetermined: return Permission.NotAsked;
+                default:                                return Permission.Blocked;
+            }
+#else
+            return Permission.NotRequired;
+#endif
+        }
+    }
+
+    /// <summary>True when the OS will actually show our messages.</summary>
+    public static bool CanPost
+    {
+        get
+        {
+            var p = Current;
+            return p == Permission.Allowed || p == Permission.NotRequired;
+        }
+    }
+
+    /// <summary>True when asking now could still produce a system dialog.</summary>
+    public static bool CanPrompt
+    {
+        get
+        {
+            var p = Current;
+            return p == Permission.NotAsked || p == Permission.Denied;
+        }
+    }
+
+    /// <summary>
+    /// Ask the OS for permission to post. Returns a handle that completes when the player has
+    /// answered — immediately if there was nothing to ask. Never throws; every failure path
+    /// resolves to a completed request so a caller waiting on it cannot hang.
+    ///
+    /// Android 13+ only ever shows the dialog twice; after that the request silently resolves as
+    /// denied and the only way back is the system settings page (<see cref="OpenSystemSettings"/>).
+    /// </summary>
+    public static Request BeginPermissionRequest()
+    {
+        var r = new Request();
+        if (!Enabled) { r.done = true; return r; }
+#if UNITY_ANDROID && !UNITY_EDITOR
+        try
+        {
+            // The package handles everything version-specific: no dialog below API 33, the
+            // "blocked in settings" case on API 24+, and the two-strikes rule on 33+.
+            r.inner = new PermissionRequest();
+            r.prompted = r.inner.Status == PermissionStatus.RequestPending;
+            r.done = !r.prompted;
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[Sonarfall] notification permission request failed: " + e.Message);
+            r.done = true;
         }
 #elif UNITY_IOS && !UNITY_EDITOR
-        iOSNotificationCenter.RequestAuthorization(
-            AuthorizationOption.Alert | AuthorizationOption.Badge | AuthorizationOption.Sound, true);
+        try
+        {
+            // registerForRemoteNotifications must stay FALSE: true would fetch an APNs device
+            // token, which is precisely the "no token, no push service" the policy promises.
+            var op = new AuthorizationRequest(
+                AuthorizationOption.Alert | AuthorizationOption.Badge | AuthorizationOption.Sound, false);
+            r.prompted = true;
+            // iOS reports through a polled object as well; wrap it so the caller sees one shape.
+            _iosPending = op; _iosRequest = r;
+        }
+        catch { r.done = true; }
+#else
+        r.done = true;
+#endif
+        return r;
+    }
+
+#if UNITY_IOS && !UNITY_EDITOR
+    private static AuthorizationRequest _iosPending;
+    private static Request _iosRequest;
+    /// <summary>iOS has no callback; GameManager's wait loop calls this each frame.</summary>
+    public static void PollIOS()
+    {
+        if (_iosPending != null && _iosPending.IsFinished)
+        {
+            _iosRequest.done = true;
+            _iosPending = null; _iosRequest = null;
+        }
+    }
+#else
+    public static void PollIOS() { }
+#endif
+
+    /// <summary>Open this app's notification page in the system Settings app. The only remedy
+    /// once the OS has stopped prompting.</summary>
+    public static void OpenSystemSettings()
+    {
+#if UNITY_ANDROID && !UNITY_EDITOR
+        try { AndroidNotificationCenter.OpenNotificationSettings(); } catch { }
+#elif UNITY_IOS && !UNITY_EDITOR
+        iOSNotificationCenter.OpenNotificationSettings();
+#else
+        Debug.Log("[Sonarfall] (notification) would open system notification settings");
 #endif
     }
 
@@ -83,6 +258,7 @@ public static class GameNotifications
     public static void OnAppForeground()
     {
         CancelAll();
+        if (_testFireAt != DateTime.MinValue && _testFireAt <= DateTime.Now) _testFireAt = DateTime.MinValue;
     }
 
     /// <summary>
@@ -123,6 +299,42 @@ public static class GameNotifications
         Schedule("Level " + level + "  ·  " + sector,
                  "The dark hasn't moved. Neither have you.",
                  DateTime.Now.AddDays(WinBackDays).Date.AddHours(MorningHour));
+
+        // 4. Tester probe, if one is armed. Re-issued here because CancelAll above wiped it.
+        if (_testFireAt > DateTime.Now)
+            Schedule("Reminders are working",
+                     "This is the Sonarfall test reminder. The real ones arrive mornings and evenings.",
+                     _testFireAt);
+    }
+
+    /// <summary>
+    /// Arm a one-off probe <paramref name="seconds"/> from now. It is only ever delivered by
+    /// <see cref="OnAppBackground"/> — the tester has to leave the app — which is exactly the case
+    /// being tested: a reminder reaching a phone whose Sonarfall is closed.
+    /// </summary>
+    public static void ScheduleTest(float seconds)
+    {
+        _testFireAt = DateTime.Now.AddSeconds(seconds);
+        EnsureChannel();
+    }
+
+    /// <summary>One line for the Settings banner and logcat: what the OS will let us do.</summary>
+    public static string Status
+    {
+        get
+        {
+            string p;
+            switch (Current)
+            {
+                case Permission.Allowed:     p = "permission granted"; break;
+                case Permission.NotAsked:    p = "permission not asked"; break;
+                case Permission.Denied:      p = "permission DENIED (can ask once more)"; break;
+                case Permission.Blocked:     p = "BLOCKED in system settings"; break;
+                case Permission.Pending:     p = "permission prompt open"; break;
+                default:                     p = "no permission needed on this platform"; break;
+            }
+            return p + " | in-game toggle " + (Enabled ? "on" : "OFF");
+        }
     }
 
     // ---------------------------------------------------------------- internals
@@ -140,14 +352,22 @@ public static class GameNotifications
         if (_channelReady) return;
         _channelReady = true;
 #if UNITY_ANDROID && !UNITY_EDITOR
-        var channel = new AndroidNotificationChannel
+        try
         {
-            Id = ChannelId,
-            Name = "Sonarfall",
-            Importance = Importance.Default,   // not High: this is a reminder, not an alarm
-            Description = "Daily maze and streak reminders",
-        };
-        AndroidNotificationCenter.RegisterNotificationChannel(channel);
+            var channel = new AndroidNotificationChannel
+            {
+                Id = ChannelId,
+                Name = "Reminders",
+                Importance = Importance.Default,   // not High: this is a reminder, not an alarm
+                Description = "Daily maze and streak reminders",
+            };
+            AndroidNotificationCenter.RegisterNotificationChannel(channel);
+        }
+        catch (Exception e)
+        {
+            _channelReady = false;
+            Debug.LogWarning("[Sonarfall] notification channel failed: " + e.Message);
+        }
 #endif
     }
 
@@ -156,15 +376,25 @@ public static class GameNotifications
         if (when <= DateTime.Now) return;
 
 #if UNITY_ANDROID && !UNITY_EDITOR
-        var n = new AndroidNotification
+        try
         {
-            Title = title,
-            Text = body,
-            FireTime = when,
-            SmallIcon = "",           // falls back to the app icon when no custom icon is set
-            LargeIcon = "",
-        };
-        AndroidNotificationCenter.SendNotification(n, ChannelId);
+            var n = new AndroidNotification
+            {
+                Title = title,
+                Text = body,
+                FireTime = when,
+                SmallIcon = SmallIconId,
+                LargeIcon = "",
+                ShowTimestamp = true,
+                ShouldAutoCancel = true,                       // tapping it clears it
+                Color = new Color(0.36f, 0.82f, 1f, 1f),       // the game's accent, in the shade
+            };
+            AndroidNotificationCenter.SendNotification(n, ChannelId);
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[Sonarfall] notification schedule failed: " + e.Message);
+        }
 #elif UNITY_IOS && !UNITY_EDITOR
         var interval = when - DateTime.Now;
         if (interval.TotalSeconds < 1) return;
@@ -189,26 +419,15 @@ public static class GameNotifications
     private static void CancelAll()
     {
 #if UNITY_ANDROID && !UNITY_EDITOR
-        AndroidNotificationCenter.CancelAllScheduledNotifications();
-        AndroidNotificationCenter.CancelAllDisplayedNotifications();
+        try
+        {
+            AndroidNotificationCenter.CancelAllScheduledNotifications();
+            AndroidNotificationCenter.CancelAllDisplayedNotifications();
+        }
+        catch { }
 #elif UNITY_IOS && !UNITY_EDITOR
         iOSNotificationCenter.RemoveAllScheduledNotifications();
         iOSNotificationCenter.RemoveAllDeliveredNotifications();
 #endif
     }
-
-#if UNITY_ANDROID && !UNITY_EDITOR
-    private static int _sdkInt = -1;
-    private static int GetSdkInt()
-    {
-        if (_sdkInt > 0) return _sdkInt;
-        try
-        {
-            using (var version = new AndroidJavaClass("android.os.Build$VERSION"))
-                _sdkInt = version.GetStatic<int>("SDK_INT");
-        }
-        catch { _sdkInt = 0; }
-        return _sdkInt;
-    }
-#endif
 }

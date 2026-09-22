@@ -171,6 +171,7 @@ public class UIManager : MonoBehaviour
     private const float StreakLostY = -250f;
     private float _streakLostT = -1f;
     private int _lastTimer = int.MinValue;
+    private int _teachOkShown = int.MinValue;   // last digit written to the OK countdown
     private bool _timerUrgent;
     private float _pingFlashT = -1f;
 
@@ -750,7 +751,11 @@ public class UIManager : MonoBehaviour
                     _teachOkLabel.color = new Color(0.95f, 0.99f, 1f, 1f);
                     _teachOkRT.localScale = Vector3.one * 1.12f;   // small pop as it becomes live
                 }
-                else _teachOkLabel.text = Mathf.CeilToInt(left).ToString();
+                else
+                {
+                    int shown = Mathf.CeilToInt(left);
+                    if (shown != _teachOkShown) { _teachOkShown = shown; _teachOkLabel.text = shown.ToString(); }
+                }
             }
             else if (_teachOkRT != null && _teachOkRT.localScale.x > 1f)
             {
@@ -1679,9 +1684,35 @@ public class UIManager : MonoBehaviour
         _hapticsLabel.color = SaveData.HapticsOn ? OnState : OffState;
         if (_notifLabel != null)
         {
-            _notifLabel.text = "REMINDERS   " + (GameNotifications.Enabled ? "ON" : "OFF");
-            _notifLabel.color = GameNotifications.Enabled ? OnState : OffState;
+            // Three states, not two: ON with the OS quietly blocking us used to read as "ON", and
+            // a tester staring at that label had no way to know the phone would never show a thing.
+            bool on = GameNotifications.Enabled;
+            bool blocked = on && !GameNotifications.CanPost;
+            _notifLabel.text = "REMINDERS   " + (blocked ? "BLOCKED" : on ? "ON" : "OFF");
+            _notifLabel.color = blocked ? new Color(1f, 0.62f, 0.35f, 1f) : on ? OnState : OffState;
         }
+    }
+
+    /// <summary>
+    /// After the player switches REMINDERS on, wait for the OS to answer. If it never even asked —
+    /// permission already refused past the point of prompting, or notifications switched off for
+    /// the app in Settings — the only honest response to "turn this on" is to take them to the
+    /// switch that is actually off. If a dialog WAS shown and they said no, respect it and do
+    /// nothing; bouncing someone into Settings a second after they declined is how apps get
+    /// uninstalled.
+    /// </summary>
+    private System.Collections.IEnumerator SettleReminderPermission(GameNotifications.Request request)
+    {
+        float waited = 0f;
+        while (!request.IsDone && waited < 30f)
+        {
+            GameNotifications.PollIOS();
+            waited += Time.unscaledDeltaTime;
+            yield return null;
+        }
+        RefreshSettingLabels();
+        if (GameNotifications.Enabled && !GameNotifications.CanPost && !request.Prompted)
+            GameNotifications.OpenSystemSettings();
     }
 
     private GameObject BuildSettings()
@@ -1726,8 +1757,13 @@ public class UIManager : MonoBehaviour
 
         var hapticBtn = Button_("HapticBtn", root, new Vector2(0.5f, 0.5f), new Vector2(0, 137), new Vector2(700, 120),
                                 "", 38, Accent, false, out _hapticsLabel);
+        // Created before the click handler so the handler can ask it whether this release is the
+        // end of a diagnostic hold. uGUI fires onClick on every pointer-up over the button, hold or
+        // not — without this check a tester running the self-test also flipped the setting off.
+        var hold = hapticBtn.gameObject.AddComponent<HoldToDiagnose>();
         hapticBtn.onClick.AddListener(() =>
         {
+            if (hold.FiredThisPress) return;
             SaveData.HapticsOn = !SaveData.HapticsOn;
             SaveData.ApplySettings();
             RefreshSettingLabels();
@@ -1741,14 +1777,35 @@ public class UIManager : MonoBehaviour
         // is how an app gets its notifications muted wholesale instead of tuned.
         var notifBtn = Button_("NotifBtn", root, new Vector2(0.5f, 0.5f), new Vector2(0, -18), new Vector2(700, 120),
                                "", 38, Accent, false, out _notifLabel);
+        var notifHold = notifBtn.gameObject.AddComponent<HoldToDiagnose>();
         notifBtn.onClick.AddListener(() =>
         {
+            if (notifHold.FiredThisPress) return;   // the release that ends a long-press is not a tap
+            // ON but blocked by the OS: the in-game switch is not the problem, so tapping the row
+            // goes straight to the system page instead of flipping a toggle that changes nothing.
+            if (GameNotifications.Enabled && !GameNotifications.CanPost)
+            {
+                GameNotifications.OpenSystemSettings();
+                return;
+            }
             GameNotifications.Enabled = !GameNotifications.Enabled;
             RefreshSettingLabels();
             // Turning it ON is the moment to ask, if we never got permission (or they said no
             // before). Turning it off just cancels — GameNotifications.Enabled handles that.
-            if (GameNotifications.Enabled) GameNotifications.RequestPermission();
+            if (GameNotifications.Enabled)
+                StartCoroutine(SettleReminderPermission(GameNotifications.BeginPermissionRequest()));
         });
+
+        // Long-press on the reminders row arms a probe that fires 60 seconds after the app is
+        // backgrounded. "Do reminders reach a closed app" is otherwise a question that takes until
+        // tomorrow morning to answer, and every tester report so far has been a guess.
+        notifHold.OnHeld = () =>
+        {
+            GameNotifications.ScheduleTest(60f);
+            ShowBanner("TEST REMINDER ARMED\n<size=55%>Leave the app now — it arrives in about a minute.\n"
+                       + GameNotifications.Status + "</size>", Accent, 5f);
+            Debug.Log("[Sonarfall] Reminder test armed: " + GameNotifications.Status);
+        };
 
         // A long-press on the vibration row runs the full ladder and prints the platform report.
         //
@@ -1756,7 +1813,6 @@ public class UIManager : MonoBehaviour
         // buzz fires depends on OS version, the OEM's motor, whether it has amplitude control, and
         // system settings the app cannot see. Any tester can now hold this row, feel six distinct
         // pulses (or not), and send back the single log line that says which of those it was.
-        var hold = hapticBtn.gameObject.AddComponent<HoldToDiagnose>();
         hold.OnHeld = () =>
         {
             Haptics.SelfTest(this);
@@ -2033,6 +2089,7 @@ public class UIManager : MonoBehaviour
         HoldLiveBanner();      // a banner already mid-flight would print through the card
         _onTeachClosed = onClosed;
         _teachT = 0f;
+        _teachOkShown = int.MinValue;   // force the first countdown digit to be written
 
         // Take (and clear) whatever ShowTeachCardAtUI staged. Every other caller therefore gets a
         // null target rather than inheriting the previous card's HUD anchor.

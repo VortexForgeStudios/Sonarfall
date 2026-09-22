@@ -187,15 +187,55 @@ public class GameManager : MonoBehaviour
     {
         SaveData.ApplySettings();
 
-        _ui.OnPlay = BeginEndlessRun;
-        _ui.OnDaily = BeginDailyRun;
+        // Every way into a level goes through the one-time notification prompt first.
+        _ui.OnPlay = () => AfterFirstRunPrompt(BeginEndlessRun);
+        _ui.OnDaily = () => AfterFirstRunPrompt(BeginDailyRun);
         _ui.OnDailyResultClosed = ReturnToMenu;
         _ui.OnResetLevel = ResetLevel;
         _ui.OnHome = GoHome;
-        _ui.OnLevelChosen = BeginRunAtLevel;
+        _ui.OnLevelChosen = level => AfterFirstRunPrompt(() => BeginRunAtLevel(level));
         _ui.Audio = _audio;     // lets the UI layer make noise without reaching for a singleton
 
         ReturnToMenu();
+    }
+
+    private bool _promptInFlight;
+
+    /// <summary>
+    /// The notification permission is asked exactly once, the first time the player taps into a
+    /// level — PLAY, DAILY or the level wheel, whichever comes first. Before that tap the app has
+    /// shown nothing worth being reminded about; after it the player is committed enough that the
+    /// dialog reads as part of setting up rather than an ambush on a cold launch.
+    ///
+    /// The run does not start until the dialog is gone. Android pauses us while it is up, so a
+    /// level started underneath would sit frozen with its tutorial half-drawn; and the answer is
+    /// reported on the OS thread, so this waits on a flag from a coroutine rather than starting
+    /// anything from the callback.
+    /// </summary>
+    private void AfterFirstRunPrompt(System.Action start)
+    {
+        if (_promptInFlight) return;                 // double-tap while the dialog is opening
+        if (SaveData.NotifAsked || !GameNotifications.CanPrompt) { start(); return; }
+
+        SaveData.MarkNotifAsked();                   // one ask, ever — even if the app dies mid-dialog
+        StartCoroutine(PromptThenStart(start));
+    }
+
+    private System.Collections.IEnumerator PromptThenStart(System.Action start)
+    {
+        _promptInFlight = true;
+        var request = GameNotifications.BeginPermissionRequest();
+        // Unscaled and capped: the menu is not paused, and if the OS never answers (a dismissed
+        // dialog on some skins reports nothing) the player must still get their level.
+        float waited = 0f;
+        while (!request.IsDone && waited < 30f)
+        {
+            GameNotifications.PollIOS();
+            waited += Time.unscaledDeltaTime;
+            yield return null;
+        }
+        _promptInFlight = false;
+        start();
     }
 
     private void ReturnToMenu()
@@ -932,13 +972,11 @@ public class GameManager : MonoBehaviour
         // On a level ladder there is no run to end, so the only way to unlock the Daily was to LOSE
         // a level: clear level 1 and it stayed locked, fail it and it opened. Winning is the more
         // obvious qualification of the two.
-        bool firstEverClear = !_isDaily && !SaveData.RunFinished;
         if (!_isDaily) SaveData.MarkRunFinished();
 
-        // Ask for notification permission here and nowhere else. Prompting on first launch is the
-        // reliable way to earn a permanent denial from someone with no reason to say yes yet; the
-        // moment after a first win is when the app has actually made its case.
-        if (firstEverClear) GameNotifications.RequestPermission();
+        // The notification prompt used to fire here, after the first clear. It moved to the first
+        // PLAY tap (AfterFirstRunPrompt): testers who had already cleared a level on an earlier
+        // build never saw it, and on Android 13+ "never asked" means "never delivered".
 
         // ---- Immediate impact ----
         // Your own ping, coming back. The cue that used to be here was a C5-E5-G5-C6 arpeggio and

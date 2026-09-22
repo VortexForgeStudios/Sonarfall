@@ -76,6 +76,7 @@ public static class Haptics
             return _platformNote
                  + " | " + TierName(_attrTier)
                  + " | system touch-feedback " + TouchFeedbackSetting()
+                 + " | media vibration " + MediaVibrationSetting()
                  + " | in-game toggle " + (Enabled ? "on" : "OFF");
 #else
             return _platformNote + " | in-game toggle " + (Enabled ? "on" : "OFF");
@@ -427,6 +428,34 @@ public static class Haptics
             {
                 int v = system.CallStatic<int>("getInt", resolver, "haptic_feedback_enabled", 1);
                 return v == 0 ? "OFF" : "on";
+            }
+        }
+        catch { return "unknown"; }
+    }
+
+    /// <summary>
+    /// The two OS switches that silence USAGE_MEDIA — the class every gameplay buzz is filed
+    /// under. Android 13+ exposes a "Media vibration" intensity slider (Samsung, Pixel, Motorola
+    /// all surface it under Sounds and vibration) and Android 14 added a master "Use vibration
+    /// and haptics" toggle. Either at OFF drops our vibrations with no error, and neither is
+    /// visible to the app except by reading the setting back. Log line only, never a gate: a
+    /// player who turned media vibration off has made a choice the game must respect.
+    /// </summary>
+    private static string MediaVibrationSetting()
+    {
+        try
+        {
+            var activity = GetActivity();
+            if (activity == null) return "unknown";
+            using (var resolver = activity.Call<AndroidJavaObject>("getContentResolver"))
+            using (var system = new AndroidJavaClass("android.provider.Settings$System"))
+            {
+                int master = system.CallStatic<int>("getInt", resolver, "vibrate_on", 1);
+                if (master == 0) return "MASTER OFF";
+                // AOSP key since API 33; OEMs that predate it or rename it report -1 -> "n/a".
+                int v = system.CallStatic<int>("getInt", resolver, "media_vibration_intensity", -1);
+                if (v < 0) return "n/a";
+                return v == 0 ? "OFF" : "intensity " + v;
             }
         }
         catch { return "unknown"; }

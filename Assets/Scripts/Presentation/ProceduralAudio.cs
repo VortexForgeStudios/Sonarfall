@@ -153,6 +153,9 @@ public class ProceduralAudio : MonoBehaviour
     private void Update()
     {
         if (_move == null) return;
+        // Idle most of the time (menus, a dot at rest): nothing to ramp, so skip the two native
+        // property writes rather than re-asserting silence every frame.
+        if (_moveTargetVol <= 0f && _move.volume <= 0f) return;
         // Smoothly open/close the whoosh and bend its pitch up with speed.
         _move.volume = Mathf.MoveTowards(_move.volume, _moveTargetVol, Time.unscaledDeltaTime * 0.8f);
         float targetPitch = 0.8f + 0.5f * _moveLevel;

@@ -23,7 +23,7 @@
 <body>
 
 <h1>Privacy Policy for Sonarfall</h1>
-<p class="meta">Last updated: 12 August 2026</p>
+<p class="meta">Last updated: 14 September 2026</p>
 
 <p>Sonarfall (&ldquo;the app&rdquo;) is developed and published by Vortex Forge Studios.
 This policy explains what the app does and does not do with your information.</p>
@@ -57,12 +57,15 @@ operating system&rsquo;s standard app-storage mechanism. This includes:</p>
 when you uninstall the app or clear its data.</p>
 
 <h2>Permissions</h2>
-<p>Sonarfall requests two Android permissions:</p>
+<p>Sonarfall requests three Android permissions:</p>
 <ul>
   <li><code>android.permission.VIBRATE</code> &mdash; haptic feedback during play.
       Can be turned off in the app&rsquo;s settings.</li>
   <li><code>android.permission.POST_NOTIFICATIONS</code> &mdash; local reminders about
       the Daily Maze and your day streak. Can be turned off in the app&rsquo;s settings.</li>
+  <li><code>android.permission.RECEIVE_BOOT_COMPLETED</code> &mdash; re-registers those same
+      local reminders after your phone restarts, so they are not silently lost. It is used for
+      nothing else and the app does not start or run in the background.</li>
 </ul>
 <p>The app does not request the internet permission.</p>
 
